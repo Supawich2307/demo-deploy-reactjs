@@ -1,0 +1,103 @@
+#!/usr/bin/groovy
+
+import groovy.json.*
+import java.text.SimpleDateFormat
+import java.io.File
+import groovy.json.JsonSlurperClassic
+
+node ('master') {
+
+    def APP_NAME = "demo-deploy-reactjs"
+    def APP_VERSION = "1.0.0"
+    def APP_PROTOCOL = "HTTPS"
+    def APP_PORT = "3000"
+    def APP_CONTEXT_PATH = "/demo"
+    def HOSTNAME = "DOMAIN"
+    def DIRECTORY_WORKSPACE = pwd()
+    def BUILD_NUMBER = "${currentBuild.number}"
+
+    stage('Build Application'){
+        sh "rm -rf ${DIRECTORY_WORKSPACE}/application"
+
+        dir ("${DIRECTORY_WORKSPACE}/application"){
+
+            git branch: "master", credentialsId: 'bitbucket-credentials', url: "https://github.com/demo-deploy-reactjs.git"
+
+            try {
+            sh "rm -rf node_modules"
+            } catch(e) {
+            println "(Can ignore) : ${e}"
+            }
+
+            sh "npm install"
+            sh "npm run build"
+            sh "cd build && zip -r ${APP_NAME}.zip"
+        }
+    }
+
+    stage('Prepare Application Artifacts'){
+        dir ("${DIRECTORY_WORKSPACE}/application/artifacts"){
+        
+            sh "openssl genrsa -out tls.key 2048 \
+            && openssl req -new -nodes -keyout tls.key -out tls.csr -config csr.conf \
+            && openssl x509 -req -days 365 -in tls.csr -signkey tls.key -out tls.crt"
+
+            def SSL_CERTIFICATE_CRT = "../tls.crt"
+            def SSL_CERTIFICATE_KEY = "../tls.key"
+
+            sh "sed -i \"s~#APP_NAME#~${APP_NAME}~g\" ."
+            sh "sed -i \"s~#APP_PROTOCOL#~${APP_PROTOCOL}~g\" ."
+            sh "sed -i \"s~#APP_PORT#~${APP_PORT}~g\" ."
+            sh "sed -i \"s~#APP_CONTEXT_PATH#~${APP_CONTEXT_PATH}~g\" ."
+            sh "sed -i \"s~#HOSTNAME#~${HOSTNAME}~g\" ."
+            sh "sed -i \"s~#SSL_CERTIFICATE_CRT#~${SSL_CERTIFICATE_CRT}~g\" ."
+            sh "sed -i \"s~#SSL_CERTIFICATE_KEY#~${SSL_CERTIFICATE_KEY}~g\" ."
+        }
+
+    }
+
+    stage('Build Application Image && Upload') {
+
+        dir("${DIRECTORY_WORKSPACE}/application") {
+            
+            sh "sudo docker build -t ${APP_NAME}:${APP_VERSION}-${BUILD_NUMBER} artifact/"
+        }
+
+        try {
+            sh "docker save -o ${APP_NAME}:${APP_VERSION}-${BUILD_NUMBER}.tar ${APP_NAME}:${APP_VERSION}-${BUILD_NUMBER}"
+            sh "scp ${APP_NAME}:${APP_VERSION}-${BUILD_NUMBER}.tar username@hostname:/images"
+
+            def cmdSSHToConsoleInstance = "ssh -o StrictHostKeyChecking=no username@hostname"
+            sh "${cmdSSHToConsoleInstance} \"docker load -i /images/${APP_NAME}:${APP_VERSION}-${BUILD_NUMBER}.tar \""
+        } catch(e) {
+            println "(Can ignore) : ${e}"
+        }
+    }
+
+
+
+    stage('Deploy Application') {
+
+        
+        def cmdSSHToConsoleInstance = "ssh -o StrictHostKeyChecking=no username@hostname"
+        
+        try {
+            sh "${cmdSSHToConsoleInstance} \"docker load -i /images/${APP_NAME}:${APP_VERSION}-${BUILD_NUMBER}.tar \""
+            sh "${cmdSSHToConsoleInstance} \"sudo docker stop ${APP_NAME}\""
+            sh "${cmdSSHToConsoleInstance} \"sudo docker ${APP_NAME}\""
+            
+        } catch(e) {
+            println "(Can ignore) : ${e}"
+        }
+        
+        def cmdStartConsoleService = "sudo docker run -d --name ${APP_NAME} -p 8080:3000 \
+        --restart always ${APP_NAME}:${APP_VERSION}-${BUILD_NUMBER}"
+        
+        sh "set +x && ${cmdSSHToConsoleInstance} \"${cmdStartConsoleService}\" && set -x"
+
+        # RESTART NGINX
+        sh "set +x && ${cmdSSHToConsoleInstance} \"sudo docker stop nginx\" && set -x"
+        sh "set +x && ${cmdSSHToConsoleInstance} \"sudo docker start nginx\" && set -x"
+    }
+
+}
